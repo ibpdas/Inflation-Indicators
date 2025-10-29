@@ -320,9 +320,9 @@ except Exception as e:
     st.error(f"Failed to read indicators.yml — {e}")
     st.stop()
 
-st.title("🇬🇧 UK Inflation & Price Indicators (ONS)")
+st.title("UK Inflation & Price Indicators (ONS)")
 st.caption(
-    "-ready microservice: CPI/CPIH/RPI + sectoral, producer & trade indices. "
+    "Microservice: CPI/CPIH/RPI + sectoral, producer & trade indices. "
     "Live from ONS API (no keys).  •  Created by **Bandhu Das**"
 )
 
@@ -331,7 +331,7 @@ with st.expander("ℹ️ About this App", expanded=False):
     st.markdown(
         """
 ### 🎯 Purpose
-This dashboard is a **-style microservice** that provides live UK inflation and price indicators
+This dashboard is a **microservice** that provides live UK inflation and price indicators
 directly from the **Office for National Statistics (ONS) Open API** — no spreadsheets or manual downloads.
 It supports economists, analysts, and policy colleagues working on food, agriculture, environment, and
 infrastructure topics where price and cost trends are critical.
