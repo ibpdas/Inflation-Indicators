@@ -183,84 +183,150 @@ def fetch_ons_series(
     endpoint_override: Dict[str, str],
 ) -> Tuple[pd.DataFrame, dict]:
     """
-    Tries multiple ONS endpoints in a robust order:
-    - Classic path
-    - Dataset-qualified (two permutations)
-    - Same again on beta domain
-    - Optional full override from YAML
-    Records every attempt in meta['debug'].
+    Robust fetcher with CSV fallback while ONS retires legacy endpoints.
+    Order:
+      1) classic JSON
+      2) dataset JSON (two permutations, api + api.beta)
+      3) discover datasetId from metadata (api + api.beta) then retry
+      4) CSV fallback via ons.gov.uk generator
     """
     debug: List[str] = []
 
-    def _try(url: str):
+    def _ok(js: dict, url: str):
+        df = _flatten_timeseries_json(js)
+        return df, {
+            "ok": True, "status": 200, "url": url,
+            "description": js.get("description"),
+            "dataset_id": js.get("datasetId"),
+            "label": js.get("label"), "source": "ONS", "debug": debug
+        }
+
+    def _try_json(url: str):
         try:
             r = requests.get(url, timeout=30)
             debug.append(f"GET {url} -> {r.status_code}")
             if r.status_code == 200:
-                try:
-                    js = r.json()
-                except Exception as e:
-                    debug.append(f"JSON error: {e}")
-                    return None
-                df = _flatten_timeseries_json(js)
-                return {
-                    "ok": True,
-                    "status": 200,
-                    "url": url,
-                    "description": js.get("description"),
-                    "dataset_id": js.get("datasetId"),
-                    "label": js.get("label"),
-                    "source": "ONS",
-                }, df
+                return _ok(r.json(), url)
             else:
-                # keep short body for troubleshooting
                 try:
-                    body = r.text[:240]
-                    debug.append(f"Body: {body}")
+                    debug.append(f"Body: {r.text[:240]}")
                 except Exception:
                     pass
-                return None
         except Exception as e:
             debug.append(f"Request error: {e}")
-            return None
+        return None
 
-    # 1) Classic
-    first = _try(base_url.format(code=series_code))
-    if first:
-        meta, df = first
-        meta["debug"] = debug
-        return df, meta
+    def _discover_dataset(code: str, host: str) -> Optional[str]:
+        meta_url = f"https://{host}/timeseries/{code}"
+        try:
+            r = requests.get(meta_url, timeout=30)
+            debug.append(f"GET {meta_url} -> {r.status_code}")
+            if r.status_code == 200:
+                ds = r.json().get("datasetId")
+                if ds:
+                    debug.append(f"Discovered datasetId={ds} on {host}")
+                return ds
+            else:
+                try:
+                    debug.append(f"Meta body: {r.text[:240]}")
+                except Exception:
+                    pass
+        except Exception as e:
+            debug.append(f"Meta error ({host}): {e}")
+        return None
 
-    # 2) Dataset-qualified (if known)
+    # 0) explicit override (last-mile fix from YAML)
+    if series_code in endpoint_override:
+        tried = _try_json(endpoint_override[series_code])
+        if tried: return tried
+
+    # 1) classic JSON
+    tried = _try_json(base_url.format(code=series_code))
+    if tried: return tried
+
+    # 2) dataset JSON using dataset_map (api + beta, two permutations)
     ds = dataset_map.get(series_code)
-    candidates: List[str] = []
     if ds:
-        candidates.extend([
+        ds_lower = ds.lower()
+        candidates = [
             f"https://api.ons.gov.uk/timeseries/{series_code}/dataset/{ds}/data",
             f"https://api.ons.gov.uk/dataset/{ds}/timeseries/{series_code}/data",
             f"https://api.beta.ons.gov.uk/timeseries/{series_code}/dataset/{ds}/data",
             f"https://api.beta.ons.gov.uk/dataset/{ds}/timeseries/{series_code}/data",
-        ])
+        ]
+        for url in candidates:
+            tried = _try_json(url)
+            if tried: return tried
 
-    # 3) Optional full override (put it last so explicit mapping wins if present)
-    if series_code in endpoint_override:
-        candidates.append(endpoint_override[series_code])
+    # 3) discover datasetId then retry JSON
+    for host in ["api.ons.gov.uk", "api.beta.ons.gov.uk"]:
+        ds2 = _discover_dataset(series_code, host)
+        if ds2:
+            for url in [
+                f"https://{host}/timeseries/{series_code}/dataset/{ds2}/data",
+                f"https://{host}/dataset/{ds2}/timeseries/{series_code}/data",
+            ]:
+                tried = _try_json(url)
+                if tried: return tried
 
-    for url in candidates:
-        tried = _try(url)
-        if tried:
-            meta, df = tried
-            meta["debug"] = debug
-            return df, meta
+    # 4) CSV fallback via ons.gov.uk generator
+    # Needs dataset slug; try map first, else guess mm23 for CPI codes.
+    ds_csv = dataset_map.get(series_code, None)
+    if not ds_csv and series_code.upper().startswith(("D7", "K3")):
+        ds_csv = "MM23"  # common for CPI/CPIH families; adjust if needed
+    if ds_csv:
+        # Construct generator URL (lowercase dataset id in path)
+        url_csv = (
+            "https://www.ons.gov.uk/generator?format=csv&uri="
+            f"/economy/inflationandpriceindices/timeseries/{series_code.lower()}/{ds_csv.lower()}"
+        )
+        try:
+            r = requests.get(url_csv, timeout=30)
+            debug.append(f"GET {url_csv} -> {r.status_code}")
+            if r.status_code == 200 and r.content:
+                # The generator returns CSV with header rows then a Date/Value table.
+                import io
+                csv_text = r.content.decode("utf-8", errors="replace")
+                # Find the start of the actual table (row beginning with 'Date' or 'Month')
+                lines = csv_text.splitlines()
+                start_idx = 0
+                for i, ln in enumerate(lines[:50]):
+                    if ln.strip().lower().startswith(("date,", "month,")):
+                        start_idx = i
+                        break
+                table_csv = "\n".join(lines[start_idx:])
+                df = pd.read_csv(io.StringIO(table_csv))
+                # Normalise columns
+                # Expect columns like ['Date','CPI INDEX 00: ALL ITEMS 2015=100']
+                val_col = [c for c in df.columns if c.lower() not in ("date", "month", "year")][0]
+                # Parse dates: if Month column exists, prefer it; else 'Date'
+                if "Month" in df.columns:
+                    df["date"] = pd.to_datetime(df["Month"], errors="coerce")
+                else:
+                    df["date"] = pd.to_datetime(df["Date"], errors="coerce")
+                df = df.rename(columns={val_col: "value"})[["date", "value"]].dropna()
+                df["value"] = pd.to_numeric(df["value"], errors="coerce")
+                df = df.sort_values("date").reset_index(drop=True)
+                return df, {
+                    "ok": True, "status": 200, "url": url_csv,
+                    "description": f"CSV generator fallback for {series_code}",
+                    "dataset_id": ds_csv, "label": None, "source": "ONS (CSV)",
+                    "debug": debug
+                }
+            else:
+                try:
+                    debug.append(f"CSV body: {r.text[:240]}")
+                except Exception:
+                    pass
+        except Exception as e:
+            debug.append(f"CSV fallback error: {e}")
 
-    # 4) All attempts failed
+    # All attempts failed
     return pd.DataFrame(columns=["date", "value"]), {
-        "ok": False,
-        "status": "not_found_or_changed",
-        "url": base_url.format(code=series_code),
-        "source": "ONS",
-        "debug": debug,
+        "ok": False, "status": "not_found_or_changed",
+        "url": base_url.format(code=series_code), "source": "ONS", "debug": debug
     }
+
 
 # ------------------------------------------------------------
 # Transforms / plotting
