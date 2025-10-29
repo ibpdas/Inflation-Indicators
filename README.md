@@ -1,7 +1,7 @@
 # UK Inflation & Price Indicators — Defra Microservice (Streamlit)
 
 A lightweight **Streamlit** app that fetches official UK price and inflation indicators from the **ONS Open API** —
-ready for **Defra economists and analysts**. Includes CPI/CPIH/RPI, sectoral CPI components (food, energy, water),
+ready for **economists and analysts**. Includes CPI/CPIH/RPI, sectoral CPI components (food, energy, water),
 producer & trade price indices (PPI input/output, import/export), and macro/labour indicators (AWE, ULC, GDP deflator).
 
 - **Live data** (no API keys) via ONS time-series endpoints
