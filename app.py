@@ -16,7 +16,7 @@ load_dotenv()
 # App config
 # ------------------------------------------------------------
 st.set_page_config(
-    page_title="UK Inflation & Price Indicators (ONS) — Defra Microservice",
+    page_title="UK Inflation & Price Indicators (ONS) — Experimental Microservice",
     layout="wide",
 )
 
@@ -265,9 +265,9 @@ with st.expander("ℹ️ About this App", expanded=False):
     st.markdown(
         """
 ### 🎯 Purpose
-This dashboard is a **Defra-style microservice** that provides live UK inflation and price indicators
+This dashboard is a **microservice** that provides live UK inflation and price indicators
 directly from the **Office for National Statistics (ONS) Open API** — no spreadsheets or manual downloads.
-It supports economists, analysts, and policy colleagues working on food, agriculture, environment, and
+It supports economists, analysts, and policy professionals working on food, agriculture, environment, and
 infrastructure topics where price and cost trends are critical.
 
 ---
