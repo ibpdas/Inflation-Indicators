@@ -1,4 +1,4 @@
-ons_api_base: "https://api.ons.gov.uk/timeseries/{code}/data"
+ons_api_base: "https://api.beta.ons.gov.uk/v1/datasets"
 
 dataset_map:
   D7BT: "MM23"   # CPI (all items, 2015=100)
