@@ -1,4 +1,10 @@
-# app.py — revised, dataset-aware ONS fetcher + full UI
+# app.py — UK Inflation & Price Indicators (ONS) — Streamlit
+# Full app with robust ONS fetch (legacy JSON + dataset paths + beta + CSV fallback),
+# About pane, Data Release Calendar, Compare view, CSV downloads, Reasoning Chatbot,
+# Debug expander, disclaimer, and credit.
+#
+# Created by Bandhu Das
+
 import os
 from typing import Dict, List, Tuple, Optional
 
@@ -9,24 +15,24 @@ import matplotlib.pyplot as plt
 import yaml
 from dateutil import parser as dtp
 
-# Optional (only for local env if you want the chatbot)
+# Optional: only needed if you want to use env vars locally for the chatbot
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# ------------------------------------------------------------
+# -------------------------
 # App config
-# ------------------------------------------------------------
+# -------------------------
 st.set_page_config(
     page_title="UK Inflation & Price Indicators (ONS) — Defra Microservice",
     layout="wide",
 )
 
-# ------------------------------------------------------------
+# -------------------------
 # Helpers: configuration & LLM (optional)
-# ------------------------------------------------------------
+# -------------------------
 def _env(name: str, default=None):
     # Prefer Streamlit secrets; fall back to env vars
     return st.secrets.get(name, os.getenv(name, default))
@@ -89,22 +95,21 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
     except Exception as e:
         return f"LLM error: {e}"
 
-# ------------------------------------------------------------
-# YAML loader (returns base_url, groups, dataset_map, endpoint_override)
-# ------------------------------------------------------------
+# -------------------------
+# YAML loader
+# -------------------------
 @st.cache_data(ttl=6 * 60 * 60)
 def load_catalog() -> Tuple[str, Dict[str, List[Dict]], Dict[str, str], Dict[str, str]]:
     """
     Load indicators.yml allowing 1+ YAML documents.
     Later docs override earlier keys; 'groups' are shallow-merged.
-    Also strips UTF-8 BOM and accidental Markdown code fences.
+    Strips UTF-8 BOM and accidental Markdown code fences.
     Returns: (ons_api_base, groups, dataset_map, endpoint_override)
     """
     import io as _io
     with open("indicators.yml", "rb") as f:
         raw = f.read()
 
-    # Strip BOM if present
     if raw.startswith(b"\xef\xbb\xbf"):
         raw = raw[3:]
 
@@ -130,9 +135,9 @@ def load_catalog() -> Tuple[str, Dict[str, List[Dict]], Dict[str, str], Dict[str
     endpoint_override = cfg.get("endpoint_override", {}) or {}
     return cfg["ons_api_base"], cfg["groups"], dataset_map, endpoint_override
 
-# ------------------------------------------------------------
+# -------------------------
 # ONS JSON flattening
-# ------------------------------------------------------------
+# -------------------------
 def _flatten_timeseries_json(js: dict) -> pd.DataFrame:
     """
     ONS time series API returns a 'years' array with optional 'months' or 'quarters'.
@@ -172,9 +177,9 @@ def _flatten_timeseries_json(js: dict) -> pd.DataFrame:
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     return df
 
-# ------------------------------------------------------------
-# Robust ONS fetcher: classic → dataset_map → endpoint_override
-# ------------------------------------------------------------
+# -------------------------
+# Robust ONS fetcher (legacy JSON → dataset paths → beta → discovery → CSV fallback)
+# -------------------------
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def fetch_ons_series(
     series_code: str,
@@ -183,10 +188,11 @@ def fetch_ons_series(
     endpoint_override: Dict[str, str],
 ) -> Tuple[pd.DataFrame, dict]:
     """
-    Robust fetcher with CSV fallback while ONS retires legacy endpoints.
+    Robust fetcher with CSV fallback while ONS transitions APIs.
     Order:
-      1) classic JSON
-      2) dataset JSON (two permutations, api + api.beta)
+      0) endpoint_override (full URL from YAML)
+      1) classic JSON /timeseries/{code}/data
+      2) dataset JSON (two permutations, api + api.beta) using dataset_map
       3) discover datasetId from metadata (api + api.beta) then retry
       4) CSV fallback via ons.gov.uk generator
     """
@@ -235,7 +241,7 @@ def fetch_ons_series(
             debug.append(f"Meta error ({host}): {e}")
         return None
 
-    # 0) explicit override (last-mile fix from YAML)
+    # 0) explicit override (user intent wins)
     if series_code in endpoint_override:
         tried = _try_json(endpoint_override[series_code])
         if tried: return tried
@@ -247,7 +253,6 @@ def fetch_ons_series(
     # 2) dataset JSON using dataset_map (api + beta, two permutations)
     ds = dataset_map.get(series_code)
     if ds:
-        ds_lower = ds.lower()
         candidates = [
             f"https://api.ons.gov.uk/timeseries/{series_code}/dataset/{ds}/data",
             f"https://api.ons.gov.uk/dataset/{ds}/timeseries/{series_code}/data",
@@ -258,7 +263,7 @@ def fetch_ons_series(
             tried = _try_json(url)
             if tried: return tried
 
-    # 3) discover datasetId then retry JSON
+    # 3) discover datasetId (api + beta) then retry JSON
     for host in ["api.ons.gov.uk", "api.beta.ons.gov.uk"]:
         ds2 = _discover_dataset(series_code, host)
         if ds2:
@@ -270,12 +275,12 @@ def fetch_ons_series(
                 if tried: return tried
 
     # 4) CSV fallback via ons.gov.uk generator
-    # Needs dataset slug; try map first, else guess mm23 for CPI codes.
+    # Needs dataset id; try map first, else guess common CPI dataset for CPI-like codes.
     ds_csv = dataset_map.get(series_code, None)
     if not ds_csv and series_code.upper().startswith(("D7", "K3")):
         ds_csv = "MM23"  # common for CPI/CPIH families; adjust if needed
+
     if ds_csv:
-        # Construct generator URL (lowercase dataset id in path)
         url_csv = (
             "https://www.ons.gov.uk/generator?format=csv&uri="
             f"/economy/inflationandpriceindices/timeseries/{series_code.lower()}/{ds_csv.lower()}"
@@ -284,29 +289,31 @@ def fetch_ons_series(
             r = requests.get(url_csv, timeout=30)
             debug.append(f"GET {url_csv} -> {r.status_code}")
             if r.status_code == 200 and r.content:
-                # The generator returns CSV with header rows then a Date/Value table.
                 import io
                 csv_text = r.content.decode("utf-8", errors="replace")
-                # Find the start of the actual table (row beginning with 'Date' or 'Month')
                 lines = csv_text.splitlines()
                 start_idx = 0
-                for i, ln in enumerate(lines[:50]):
+                for i, ln in enumerate(lines[:80]):
                     if ln.strip().lower().startswith(("date,", "month,")):
                         start_idx = i
                         break
                 table_csv = "\n".join(lines[start_idx:])
                 df = pd.read_csv(io.StringIO(table_csv))
-                # Normalise columns
-                # Expect columns like ['Date','CPI INDEX 00: ALL ITEMS 2015=100']
+                # Identify value column (first non-date-ish column)
                 val_col = [c for c in df.columns if c.lower() not in ("date", "month", "year")][0]
-                # Parse dates: if Month column exists, prefer it; else 'Date'
-                if "Month" in df.columns:
-                    df["date"] = pd.to_datetime(df["Month"], errors="coerce")
+                # Parse dates
+                date_col = "Month" if "Month" in df.columns else ("Date" if "Date" in df.columns else None)
+                if date_col:
+                    df["date"] = pd.to_datetime(df[date_col], errors="coerce")
                 else:
-                    df["date"] = pd.to_datetime(df["Date"], errors="coerce")
+                    # fallback: try Year/Month composite if present
+                    if "Year" in df.columns and "Month" in df.columns:
+                        df["date"] = pd.to_datetime(df["Year"].astype(str) + "-" + df["Month"].astype(str) + "-01", errors="coerce")
+                    else:
+                        df["date"] = pd.NaT
                 df = df.rename(columns={val_col: "value"})[["date", "value"]].dropna()
                 df["value"] = pd.to_numeric(df["value"], errors="coerce")
-                df = df.sort_values("date").reset_index(drop=True)
+                df = df.dropna().sort_values("date").reset_index(drop=True)
                 return df, {
                     "ok": True, "status": 200, "url": url_csv,
                     "description": f"CSV generator fallback for {series_code}",
@@ -327,10 +334,9 @@ def fetch_ons_series(
         "url": base_url.format(code=series_code), "source": "ONS", "debug": debug
     }
 
-
-# ------------------------------------------------------------
+# -------------------------
 # Transforms / plotting
-# ------------------------------------------------------------
+# -------------------------
 def pct_change_12m(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["yoy_%"] = out["value"].pct_change(12) * 100
@@ -343,7 +349,7 @@ def pct_change_mom(df: pd.DataFrame) -> pd.DataFrame:
 
 def plot_line(df: pd.DataFrame, col: str, title: str, ylabel: str):
     fig, ax = plt.subplots(figsize=(9, 4))
-    ax.plot(df["date"], df[col])
+    ax.plot(df["date"], df[col])  # (style/colors intentionally default)
     ax.set_title(title)
     ax.set_ylabel(ylabel)
     ax.set_xlabel("")
@@ -375,8 +381,13 @@ def format_series_context(series_name: str, df: pd.DataFrame) -> dict:
         "mom_percent": mom
     }
 
-def build_context_blob(selected_labels: List[str], label_to_code: Dict[str, str], base_url: str,
-                       dataset_map: Dict[str, str], endpoint_override: Dict[str, str]) -> dict:
+def build_context_blob(
+    selected_labels: List[str],
+    label_to_code: Dict[str, str],
+    base_url: str,
+    dataset_map: Dict[str, str],
+    endpoint_override: Dict[str, str],
+) -> dict:
     out = {"selected": []}
     for lab in selected_labels[:5]:
         code = label_to_code[lab]
@@ -389,23 +400,18 @@ def build_context_blob(selected_labels: List[str], label_to_code: Dict[str, str]
         })
     return out
 
-# 🔧 Debug panel: shows all URL attempts/status codes
-with st.expander("🔧 Debug (fetch details)"):
-    st.write(meta.get("debug"))
-
-
-# ------------------------------------------------------------
+# -------------------------
 # UI
-# ------------------------------------------------------------
+# -------------------------
 try:
     base_url, groups, dataset_map, endpoint_override = load_catalog()
 except Exception as e:
     st.error(f"Failed to read indicators.yml — {e}")
     st.stop()
 
-st.title("UK Inflation & Price Indicators (ONS)")
+st.title("🇬🇧 UK Inflation & Price Indicators (ONS)")
 st.caption(
-    "Experimental Microservice: CPI/CPIH/RPI + sectoral, producer & trade indices. "
+    "Defra-ready microservice: CPI/CPIH/RPI + sectoral, producer & trade indices. "
     "Live from ONS API (no keys).  •  Created by **Bandhu Das**"
 )
 
@@ -414,7 +420,7 @@ with st.expander("ℹ️ About this App", expanded=False):
     st.markdown(
         """
 ### 🎯 Purpose
-This dashboard is a **microservice** that provides live UK inflation and price indicators
+This dashboard is a **Defra-style microservice** that provides live UK inflation and price indicators
 directly from the **Office for National Statistics (ONS) Open API** — no spreadsheets or manual downloads.
 It supports economists, analysts, and policy colleagues working on food, agriculture, environment, and
 infrastructure topics where price and cost trends are critical.
@@ -667,9 +673,9 @@ with st.expander("🧠 Reasoning Chatbot (beta)", expanded=False):
         st.write(reply)
         st.caption("Model output is experimental and for educational use.")
 
-# ------------------------------------------------------------
+# -------------------------
 # Footer: provenance, issues link, disclaimer, credit
-# ------------------------------------------------------------
+# -------------------------
 st.divider()
 
 c1, c2 = st.columns([3, 1])
