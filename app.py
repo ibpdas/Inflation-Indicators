@@ -1,5 +1,6 @@
+# app.py
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import requests
 import pandas as pd
@@ -8,15 +9,18 @@ import matplotlib.pyplot as plt
 import yaml
 from dateutil import parser as dtp
 
-# Optional: env-based model config (works with Streamlit secrets too)
-from dotenv import load_dotenv
-load_dotenv()
+# Optional (only needed if you want to use env vars locally for the chatbot)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 # ------------------------------------------------------------
 # App config
 # ------------------------------------------------------------
 st.set_page_config(
-    page_title="UK Inflation & Price Indicators (ONS) — Experimental Microservice",
+    page_title="UK Inflation & Price Indicators (ONS) — Defra Microservice",
     layout="wide",
 )
 
@@ -30,7 +34,7 @@ def _env(name: str, default=None):
 def call_llm(system_prompt: str, user_prompt: str) -> str:
     """
     Provider-agnostic call: supports OpenAI-compatible or local Ollama.
-    Configure in Streamlit secrets or environment variables:
+    Configure via Streamlit secrets or environment variables:
       LLM_PROVIDER=openai|ollama
       OPENAI_API_KEY=...
       OPENAI_BASE_URL=https://api.openai.com/v1
@@ -52,11 +56,13 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
             ],
             "stream": False,
         }
-        r = requests.post(url, json=payload, timeout=120)
-        if r.status_code != 200:
-            return f"Ollama error: {r.status_code} — {r.text[:300]}"
-        data = r.json()
-        return data.get("message", {}).get("content", "").strip()
+        try:
+            r = requests.post(url, json=payload, timeout=120)
+            r.raise_for_status()
+            data = r.json()
+            return data.get("message", {}).get("content", "").strip()
+        except Exception as e:
+            return f"Ollama error: {e}"
 
     # OpenAI-compatible default
     base = str(_env("OPENAI_BASE_URL", "https://api.openai.com/v1")).rstrip("/")
@@ -75,31 +81,56 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
             {"role": "user", "content": user_prompt},
         ],
     }
-    r = requests.post(url, headers=headers, json=payload, timeout=120)
-    if r.status_code != 200:
-        return f"LLM error: {r.status_code} — {r.text[:300]}"
-    data = r.json()
-    return data["choices"][0]["message"]["content"].strip()
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=120)
+        r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"LLM error: {e}"
 
 # ------------------------------------------------------------
-# Data/catalog helpers
+# Data/catalog helpers (robust to multi-doc YAML and BOM/fences)
 # ------------------------------------------------------------
 @st.cache_data(ttl=6 * 60 * 60)
 def load_catalog() -> Tuple[str, Dict[str, List[Dict]]]:
     """
-    Loads indicator groups and the ONS API base from indicators.yml
+    Load indicators.yml allowing 1+ YAML documents.
+    Later docs override earlier keys; 'groups' are shallow-merged.
+    Also strips UTF-8 BOM and accidental Markdown code fences.
     """
-    with open("indicators.yml", "r") as f:
-        cfg = yaml.safe_load(f)
-    base = cfg["ons_api_base"]
-    groups = cfg["groups"]
-    return base, groups
+    import io as _io
+    with open("indicators.yml", "rb") as f:
+        raw = f.read()
 
+    # Strip BOM if present
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+
+    txt = raw.decode("utf-8", errors="replace")
+    txt = txt.replace("```yaml", "").replace("```", "")
+
+    docs = [d for d in yaml.safe_load_all(_io.StringIO(txt)) if isinstance(d, dict)]
+    if not docs:
+        raise ValueError("indicators.yml is empty or invalid YAML.")
+
+    cfg: Dict = {}
+    for d in docs:
+        for k, v in d.items():
+            if k == "groups" and isinstance(v, dict):
+                cfg.setdefault("groups", {}).update(v)
+            else:
+                cfg[k] = v
+
+    if "ons_api_base" not in cfg or "groups" not in cfg:
+        raise ValueError("indicators.yml must define 'ons_api_base' and 'groups'.")
+
+    return cfg["ons_api_base"], cfg["groups"]
 
 def _flatten_timeseries_json(js: dict) -> pd.DataFrame:
     """
     ONS time series API returns a 'years' array with optional 'months' or 'quarters'.
-    This flattens to a monthly-like time index when possible.
+    Flatten to monthly-like time index when possible.
     """
     rows = []
     for y in js.get("years", []):
@@ -111,15 +142,10 @@ def _flatten_timeseries_json(js: dict) -> pd.DataFrame:
                 v = m.get("value")
                 if v in (None, ""):
                     continue
-                mm = (
-                    f"{int(m['month']):02d}"
-                    if str(m.get("month", "")).isdigit()
-                    else m["month"]
-                )
+                mm = f"{int(m['month']):02d}" if str(m.get("month", "")).isdigit() else m["month"]
                 dt_obj = dtp.parse(f"{year}-{mm}-01")
                 rows.append({"date": dt_obj, "value": float(v)})
         elif quarters:
-            # approximate quarter to first month of quarter
             map_q = {"Q1": "01", "Q2": "04", "Q3": "07", "Q4": "10"}
             for q in quarters:
                 v = q.get("value")
@@ -133,56 +159,92 @@ def _flatten_timeseries_json(js: dict) -> pd.DataFrame:
             if v not in (None, ""):
                 dt_obj = dtp.parse(f"{year}-01-01")
                 rows.append({"date": dt_obj, "value": float(v)})
+
     if not rows:
         return pd.DataFrame(columns=["date", "value"])
     df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     return df
 
+# ---- NEW: metadata helper + dataset-aware fetch (fix for 404 like D7BU) ----
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def _get_series_meta(series_code: str) -> Optional[dict]:
+    """Query ONS for a series' metadata to discover its datasetId."""
+    base_meta = f"https://api.ons.gov.uk/timeseries/{series_code}"
+    try:
+        r = requests.get(base_meta, timeout=30)
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
 
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
 def fetch_ons_series(series_code: str, base_url: str) -> Tuple[pd.DataFrame, dict]:
     """
-    Fetch a single ONS time series by code.
-    Returns (dataframe, metadata)
+    Fetch series data. If /timeseries/{code}/data 404s, auto-discover datasetId and retry
+    /timeseries/{code}/dataset/{datasetId}/data
     """
-    url = base_url.format(code=series_code)
+    # 1) Try the simple endpoint first
+    url_primary = base_url.format(code=series_code)
     try:
-        r = requests.get(url, timeout=30)
+        r = requests.get(url_primary, timeout=30)
     except Exception as e:
         return pd.DataFrame(columns=["date", "value"]), {
-            "ok": False,
-            "status": f"request_error: {e}",
-            "url": url,
+            "ok": False, "status": f"request_error: {e}", "url": url_primary
         }
 
-    if r.status_code != 200:
+    if r.status_code == 200:
+        try:
+            js = r.json()
+        except Exception:
+            return pd.DataFrame(columns=["date", "value"]), {
+                "ok": False, "status": "invalid_json", "url": url_primary
+            }
+        df = _flatten_timeseries_json(js)
+        return df, {
+            "ok": True, "status": 200, "url": url_primary,
+            "description": js.get("description"),
+            "dataset_id": js.get("datasetId"),
+            "label": js.get("label"),
+            "source": "ONS",
+        }
+
+    # 2) If not 200, try discovering datasetId then retry a dataset-qualified URL
+    meta = _get_series_meta(series_code)
+    dsid = (meta or {}).get("datasetId")
+    if dsid:
+        url_ds = f"https://api.ons.gov.uk/timeseries/{series_code}/dataset/{dsid}/data"
+        r2 = requests.get(url_ds, timeout=30)
+        if r2.status_code == 200:
+            try:
+                js2 = r2.json()
+            except Exception:
+                return pd.DataFrame(columns=["date", "value"]), {
+                    "ok": False, "status": "invalid_json", "url": url_ds
+                }
+            df = _flatten_timeseries_json(js2)
+            return df, {
+                "ok": True, "status": 200, "url": url_ds,
+                "description": js2.get("description"),
+                "dataset_id": dsid,
+                "label": js2.get("label"),
+                "source": "ONS",
+            }
+
+        # Clearer message if the dataset-qualified retry fails too
         return pd.DataFrame(columns=["date", "value"]), {
             "ok": False,
-            "status": r.status_code,
-            "url": url,
+            "status": f"{r.status_code} then {r2.status_code}",
+            "url": f"{url_primary}  | retried: {url_ds}"
         }
 
-    try:
-        js = r.json()
-    except Exception:
-        return pd.DataFrame(columns=["date", "value"]), {
-            "ok": False,
-            "status": "invalid_json",
-            "url": url,
-        }
-
-    df = _flatten_timeseries_json(js)
-    meta = {
-        "ok": True,
-        "status": 200,
-        "url": url,
-        "description": js.get("description"),
-        "dataset_id": js.get("datasetId"),
-        "label": js.get("label"),
-        "source": "ONS",
+    # 3) No datasetId found and primary failed
+    return pd.DataFrame(columns=["date", "value"]), {
+        "ok": False,
+        "status": r.status_code,
+        "url": url_primary
     }
-    return df, meta
 
 # ------------------------------------------------------------
 # Transformations / plotting
@@ -199,7 +261,7 @@ def pct_change_mom(df: pd.DataFrame) -> pd.DataFrame:
 
 def plot_line(df: pd.DataFrame, col: str, title: str, ylabel: str):
     """
-    NOTE: We intentionally avoid setting colors/styles.
+    NOTE: We intentionally avoid setting colors/styles per design guidance.
     """
     fig, ax = plt.subplots(figsize=(9, 4))
     ax.plot(df["date"], df[col])
@@ -235,7 +297,7 @@ def format_series_context(series_name: str, df: pd.DataFrame) -> dict:
         "mom_percent": mom
     }
 
-def build_context_blob(selected_labels: list, label_to_code: dict, base_url: str) -> dict:
+def build_context_blob(selected_labels: List[str], label_to_code: Dict[str, str], base_url: str) -> dict:
     """Gather small, privacy-safe context for multiple series."""
     out = {"selected": []}
     for lab in selected_labels[:5]:
@@ -252,7 +314,11 @@ def build_context_blob(selected_labels: list, label_to_code: dict, base_url: str
 # ------------------------------------------------------------
 # UI
 # ------------------------------------------------------------
-base_url, groups = load_catalog()
+try:
+    base_url, groups = load_catalog()
+except Exception as e:
+    st.error(f"Failed to read indicators.yml — {e}")
+    st.stop()
 
 st.title("🇬🇧 UK Inflation & Price Indicators (ONS)")
 st.caption(
@@ -265,9 +331,9 @@ with st.expander("ℹ️ About this App", expanded=False):
     st.markdown(
         """
 ### 🎯 Purpose
-This dashboard is a **microservice** that provides live UK inflation and price indicators
+This dashboard is a **Defra-style microservice** that provides live UK inflation and price indicators
 directly from the **Office for National Statistics (ONS) Open API** — no spreadsheets or manual downloads.
-It supports economists, analysts, and policy professionals working on food, agriculture, environment, and
+It supports economists, analysts, and policy colleagues working on food, agriculture, environment, and
 infrastructure topics where price and cost trends are critical.
 
 ---
