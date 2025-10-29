@@ -181,157 +181,83 @@ def _flatten_timeseries_json(js: dict) -> pd.DataFrame:
 # Robust ONS fetcher (legacy JSON → dataset paths → beta → discovery → CSV fallback)
 # -------------------------
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
-def fetch_ons_series(
-    series_code: str,
-    base_url: str,
-    dataset_map: Dict[str, str],
-    endpoint_override: Dict[str, str],
-) -> Tuple[pd.DataFrame, dict]:
+def fetch_ons_series(series_code: str, base_url: str,
+                     dataset_map: Dict[str, str],
+                     endpoint_override: Dict[str, str]) -> Tuple[pd.DataFrame, dict]:
     """
-    Robust fetcher with CSV fallback while ONS transitions APIs.
-    Order:
-      0) endpoint_override (full URL from YAML)
-      1) classic JSON /timeseries/{code}/data
-      2) dataset JSON (two permutations, api + api.beta) using dataset_map
-      3) discover datasetId from metadata (api + api.beta) then retry
-      4) CSV fallback via ons.gov.uk generator
+    Updated for ONS API v1 (beta.ons.gov.uk/v1/datasets/.../observations)
+    Falls back to CSV generator if needed.
     """
-    debug: List[str] = []
-
-    def _ok(js: dict, url: str):
-        df = _flatten_timeseries_json(js)
-        return df, {
-            "ok": True, "status": 200, "url": url,
-            "description": js.get("description"),
-            "dataset_id": js.get("datasetId"),
-            "label": js.get("label"), "source": "ONS", "debug": debug
-        }
+    debug = []
 
     def _try_json(url: str):
         try:
             r = requests.get(url, timeout=30)
             debug.append(f"GET {url} -> {r.status_code}")
             if r.status_code == 200:
-                return _ok(r.json(), url)
-            else:
-                try:
-                    debug.append(f"Body: {r.text[:240]}")
-                except Exception:
-                    pass
+                js = r.json()
+                obs = js.get("observations", [])
+                if not obs:
+                    return None
+                df = pd.DataFrame(obs)
+                # Typical fields: time, value, and dimension labels
+                if "time" in df.columns and "value" in df.columns:
+                    df["date"] = pd.to_datetime(df["time"], errors="coerce")
+                    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+                    df = df.dropna().sort_values("date").reset_index(drop=True)
+                    return df, {
+                        "ok": True, "status": 200, "url": url,
+                        "description": "v1 dataset observations", "source": "ONS v1",
+                        "debug": debug
+                    }
         except Exception as e:
-            debug.append(f"Request error: {e}")
+            debug.append(f"Error: {e}")
         return None
 
-    def _discover_dataset(code: str, host: str) -> Optional[str]:
-        meta_url = f"https://{host}/timeseries/{code}"
-        try:
-            r = requests.get(meta_url, timeout=30)
-            debug.append(f"GET {meta_url} -> {r.status_code}")
-            if r.status_code == 200:
-                ds = r.json().get("datasetId")
-                if ds:
-                    debug.append(f"Discovered datasetId={ds} on {host}")
-                return ds
-            else:
-                try:
-                    debug.append(f"Meta body: {r.text[:240]}")
-                except Exception:
-                    pass
-        except Exception as e:
-            debug.append(f"Meta error ({host}): {e}")
-        return None
+    # 1️⃣ Try v1 datasets API (beta)
+    ds = dataset_map.get(series_code, "MM23").lower()
+    candidates = [
+        f"https://api.beta.ons.gov.uk/v1/datasets/{ds}/editions/time-series/versions/7/observations?time=*&aggregate={series_code.lower()}"
+    ]
+    for url in candidates:
+        tried = _try_json(url)
+        if tried:
+            return tried
 
-    # 0) explicit override (user intent wins)
-    if series_code in endpoint_override:
-        tried = _try_json(endpoint_override[series_code])
-        if tried: return tried
+    # 2️⃣ Fallback to CSV generator (still works for all series)
+    url_csv = (
+        "https://www.ons.gov.uk/generator?format=csv&uri="
+        f"/economy/inflationandpriceindices/timeseries/{series_code.lower()}/{ds}"
+    )
+    try:
+        r = requests.get(url_csv, timeout=30)
+        debug.append(f"GET {url_csv} -> {r.status_code}")
+        if r.status_code == 200:
+            import io
+            csv_text = r.content.decode("utf-8", errors="replace")
+            lines = csv_text.splitlines()
+            start = 0
+            for i, ln in enumerate(lines[:80]):
+                if ln.strip().lower().startswith(("date,", "month,")):
+                    start = i
+                    break
+            df = pd.read_csv(io.StringIO("\n".join(lines[start:])))
+            val_col = [c for c in df.columns if c.lower() not in ("date", "month", "year")][0]
+            date_col = "Month" if "Month" in df.columns else "Date"
+            df["date"] = pd.to_datetime(df[date_col], errors="coerce")
+            df = df.rename(columns={val_col: "value"})[["date", "value"]].dropna()
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+            df = df.dropna().sort_values("date").reset_index(drop=True)
+            return df, {
+                "ok": True, "status": 200, "url": url_csv,
+                "description": "CSV fallback", "source": "ONS CSV", "debug": debug
+            }
+    except Exception as e:
+        debug.append(f"CSV fallback error: {e}")
 
-    # 1) classic JSON
-    tried = _try_json(base_url.format(code=series_code))
-    if tried: return tried
-
-    # 2) dataset JSON using dataset_map (api + beta, two permutations)
-    ds = dataset_map.get(series_code)
-    if ds:
-        candidates = [
-            f"https://api.ons.gov.uk/timeseries/{series_code}/dataset/{ds}/data",
-            f"https://api.ons.gov.uk/dataset/{ds}/timeseries/{series_code}/data",
-            f"https://api.beta.ons.gov.uk/timeseries/{series_code}/dataset/{ds}/data",
-            f"https://api.beta.ons.gov.uk/dataset/{ds}/timeseries/{series_code}/data",
-        ]
-        for url in candidates:
-            tried = _try_json(url)
-            if tried: return tried
-
-    # 3) discover datasetId (api + beta) then retry JSON
-    for host in ["api.ons.gov.uk", "api.beta.ons.gov.uk"]:
-        ds2 = _discover_dataset(series_code, host)
-        if ds2:
-            for url in [
-                f"https://{host}/timeseries/{series_code}/dataset/{ds2}/data",
-                f"https://{host}/dataset/{ds2}/timeseries/{series_code}/data",
-            ]:
-                tried = _try_json(url)
-                if tried: return tried
-
-    # 4) CSV fallback via ons.gov.uk generator
-    # Needs dataset id; try map first, else guess common CPI dataset for CPI-like codes.
-    ds_csv = dataset_map.get(series_code, None)
-    if not ds_csv and series_code.upper().startswith(("D7", "K3")):
-        ds_csv = "MM23"  # common for CPI/CPIH families; adjust if needed
-
-    if ds_csv:
-        url_csv = (
-            "https://www.ons.gov.uk/generator?format=csv&uri="
-            f"/economy/inflationandpriceindices/timeseries/{series_code.lower()}/{ds_csv.lower()}"
-        )
-        try:
-            r = requests.get(url_csv, timeout=30)
-            debug.append(f"GET {url_csv} -> {r.status_code}")
-            if r.status_code == 200 and r.content:
-                import io
-                csv_text = r.content.decode("utf-8", errors="replace")
-                lines = csv_text.splitlines()
-                start_idx = 0
-                for i, ln in enumerate(lines[:80]):
-                    if ln.strip().lower().startswith(("date,", "month,")):
-                        start_idx = i
-                        break
-                table_csv = "\n".join(lines[start_idx:])
-                df = pd.read_csv(io.StringIO(table_csv))
-                # Identify value column (first non-date-ish column)
-                val_col = [c for c in df.columns if c.lower() not in ("date", "month", "year")][0]
-                # Parse dates
-                date_col = "Month" if "Month" in df.columns else ("Date" if "Date" in df.columns else None)
-                if date_col:
-                    df["date"] = pd.to_datetime(df[date_col], errors="coerce")
-                else:
-                    # fallback: try Year/Month composite if present
-                    if "Year" in df.columns and "Month" in df.columns:
-                        df["date"] = pd.to_datetime(df["Year"].astype(str) + "-" + df["Month"].astype(str) + "-01", errors="coerce")
-                    else:
-                        df["date"] = pd.NaT
-                df = df.rename(columns={val_col: "value"})[["date", "value"]].dropna()
-                df["value"] = pd.to_numeric(df["value"], errors="coerce")
-                df = df.dropna().sort_values("date").reset_index(drop=True)
-                return df, {
-                    "ok": True, "status": 200, "url": url_csv,
-                    "description": f"CSV generator fallback for {series_code}",
-                    "dataset_id": ds_csv, "label": None, "source": "ONS (CSV)",
-                    "debug": debug
-                }
-            else:
-                try:
-                    debug.append(f"CSV body: {r.text[:240]}")
-                except Exception:
-                    pass
-        except Exception as e:
-            debug.append(f"CSV fallback error: {e}")
-
-    # All attempts failed
     return pd.DataFrame(columns=["date", "value"]), {
         "ok": False, "status": "not_found_or_changed",
-        "url": base_url.format(code=series_code), "source": "ONS", "debug": debug
+        "url": f"https://api.beta.ons.gov.uk/v1/datasets/{ds}", "debug": debug
     }
 
 # -------------------------
