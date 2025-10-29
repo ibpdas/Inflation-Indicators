@@ -1,17 +1,17 @@
 ons_api_base: "https://api.ons.gov.uk/timeseries/{code}/data"
 
 dataset_map:
-  D7BT: "MM23"   # CPI (All items)
-  L522: "MM23"   # CPIH (headline)
-  D7BU: "MM23"   # CPI: Food & Non-Alcoholic Beverages
-  D7BZ: "MM23"   # CPI: Energy (Gas/Electricity/Fuels)
-  K35M: "MM23"   # CPI: Water Supply & Sewerage
-  K37M: "MM23"   # CPI: Transport Services
-  K35Q: "MM23"   # CPI: Health
-  K35X: "MM23"   # CPI: Education
-  # You can add more later when needed
+  D7BT: "MM23"   # CPI (all items, 2015=100)
+  L522: "MM23"   # CPIH
+  D7BU: "MM23"   # Food & non-alcoholic beverages
+  D7BZ: "MM23"   # Energy
+  K35M: "MM23"   # Water
+  K37M: "MM23"   # Transport services
+  K35Q: "MM23"   # Health
+  K35X: "MM23"   # Education
 
 endpoint_override: {}
+
 
 groups:
   Consumer Inflation:
