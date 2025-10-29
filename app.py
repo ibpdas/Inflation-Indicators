@@ -1,4 +1,4 @@
-# app.py
+# app.py — revised, dataset-aware ONS fetcher + full UI
 import os
 from typing import Dict, List, Tuple, Optional
 
@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import yaml
 from dateutil import parser as dtp
 
-# Optional (only needed if you want to use env vars locally for the chatbot)
+# Optional (only for local env if you want the chatbot)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -20,12 +20,12 @@ except Exception:
 # App config
 # ------------------------------------------------------------
 st.set_page_config(
-    page_title="UK Inflation & Price Indicators (ONS) — Microservice",
+    page_title="UK Inflation & Price Indicators (ONS) — Defra Microservice",
     layout="wide",
 )
 
 # ------------------------------------------------------------
-# Helpers: configuration & LLM
+# Helpers: configuration & LLM (optional)
 # ------------------------------------------------------------
 def _env(name: str, default=None):
     # Prefer Streamlit secrets; fall back to env vars
@@ -90,14 +90,15 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
         return f"LLM error: {e}"
 
 # ------------------------------------------------------------
-# Data/catalog helpers (robust to multi-doc YAML and BOM/fences)
+# YAML loader (returns base_url, groups, dataset_map, endpoint_override)
 # ------------------------------------------------------------
 @st.cache_data(ttl=6 * 60 * 60)
-def load_catalog() -> Tuple[str, Dict[str, List[Dict]]]:
+def load_catalog() -> Tuple[str, Dict[str, List[Dict]], Dict[str, str], Dict[str, str]]:
     """
     Load indicators.yml allowing 1+ YAML documents.
     Later docs override earlier keys; 'groups' are shallow-merged.
     Also strips UTF-8 BOM and accidental Markdown code fences.
+    Returns: (ons_api_base, groups, dataset_map, endpoint_override)
     """
     import io as _io
     with open("indicators.yml", "rb") as f:
@@ -125,8 +126,13 @@ def load_catalog() -> Tuple[str, Dict[str, List[Dict]]]:
     if "ons_api_base" not in cfg or "groups" not in cfg:
         raise ValueError("indicators.yml must define 'ons_api_base' and 'groups'.")
 
-    return cfg["ons_api_base"], cfg["groups"]
+    dataset_map = cfg.get("dataset_map", {}) or {}
+    endpoint_override = cfg.get("endpoint_override", {}) or {}
+    return cfg["ons_api_base"], cfg["groups"], dataset_map, endpoint_override
 
+# ------------------------------------------------------------
+# ONS JSON flattening
+# ------------------------------------------------------------
 def _flatten_timeseries_json(js: dict) -> pd.DataFrame:
     """
     ONS time series API returns a 'years' array with optional 'months' or 'quarters'.
@@ -166,88 +172,99 @@ def _flatten_timeseries_json(js: dict) -> pd.DataFrame:
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     return df
 
-# ---- NEW: metadata helper + dataset-aware fetch (fix for 404 like D7BU) ----
+# ------------------------------------------------------------
+# Robust ONS fetcher: classic → dataset_map → endpoint_override
+# ------------------------------------------------------------
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
-def _get_series_meta(series_code: str) -> Optional[dict]:
-    """Query ONS for a series' metadata to discover its datasetId."""
-    base_meta = f"https://api.ons.gov.uk/timeseries/{series_code}"
-    try:
-        r = requests.get(base_meta, timeout=30)
-        if r.status_code != 200:
-            return None
-        return r.json()
-    except Exception:
-        return None
+def fetch_ons_series(
+    series_code: str,
+    base_url: str,
+    dataset_map: Dict[str, str],
+    endpoint_override: Dict[str, str],
+) -> Tuple[pd.DataFrame, dict]:
+    """
+    Tries three strategies in order:
+      (A) classic:         /timeseries/{code}/data
+      (B) dataset_map:     /timeseries/{code}/dataset/{datasetId}/data  (from YAML)
+      (C) endpoint_override: use full URL from YAML (last resort)
+    Returns (df, meta) and never throws; meta['debug'] includes all attempts.
+    """
+    debug_notes = []
 
-@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
-def fetch_ons_series(series_code: str, base_url: str) -> Tuple[pd.DataFrame, dict]:
-    """
-    Fetch series data. If /timeseries/{code}/data 404s, auto-discover datasetId and retry
-    /timeseries/{code}/dataset/{datasetId}/data
-    """
-    # 1) Try the simple endpoint first
+    # (C) Full override first if provided (explicit user choice wins)
+    if series_code in endpoint_override:
+        url = endpoint_override[series_code]
+        try:
+            r = requests.get(url, timeout=30)
+            debug_notes.append(f"override {url} -> {r.status_code}")
+            if r.status_code == 200:
+                js = r.json()
+                df = _flatten_timeseries_json(js)
+                return df, {
+                    "ok": True, "status": 200, "url": url,
+                    "description": js.get("description"), "dataset_id": js.get("datasetId"),
+                    "label": js.get("label"), "source": "ONS", "debug": debug_notes
+                }
+            else:
+                try:
+                    debug_notes.append(f"override body: {r.text[:240]}")
+                except Exception:
+                    pass
+        except Exception as e:
+            debug_notes.append(f"override error: {e}")
+
+    # (A) Classic endpoint
     url_primary = base_url.format(code=series_code)
     try:
         r = requests.get(url_primary, timeout=30)
-    except Exception as e:
-        return pd.DataFrame(columns=["date", "value"]), {
-            "ok": False, "status": f"request_error: {e}", "url": url_primary
-        }
-
-    if r.status_code == 200:
-        try:
+        debug_notes.append(f"classic {url_primary} -> {r.status_code}")
+        if r.status_code == 200:
             js = r.json()
-        except Exception:
-            return pd.DataFrame(columns=["date", "value"]), {
-                "ok": False, "status": "invalid_json", "url": url_primary
+            df = _flatten_timeseries_json(js)
+            return df, {
+                "ok": True, "status": 200, "url": url_primary,
+                "description": js.get("description"), "dataset_id": js.get("datasetId"),
+                "label": js.get("label"), "source": "ONS", "debug": debug_notes
             }
-        df = _flatten_timeseries_json(js)
-        return df, {
-            "ok": True, "status": 200, "url": url_primary,
-            "description": js.get("description"),
-            "dataset_id": js.get("datasetId"),
-            "label": js.get("label"),
-            "source": "ONS",
-        }
+        else:
+            try:
+                debug_notes.append(f"classic body: {r.text[:240]}")
+            except Exception:
+                pass
+    except Exception as e:
+        debug_notes.append(f"classic error: {e}")
 
-    # 2) If not 200, try discovering datasetId then retry a dataset-qualified URL
-    meta = _get_series_meta(series_code)
-    dsid = (meta or {}).get("datasetId")
+    # (B) Dataset-qualified if we have a mapping
+    dsid = dataset_map.get(series_code)
     if dsid:
         url_ds = f"https://api.ons.gov.uk/timeseries/{series_code}/dataset/{dsid}/data"
-        r2 = requests.get(url_ds, timeout=30)
-        if r2.status_code == 200:
-            try:
+        try:
+            r2 = requests.get(url_ds, timeout=30)
+            debug_notes.append(f"dataset_map {url_ds} -> {r2.status_code}")
+            if r2.status_code == 200:
                 js2 = r2.json()
-            except Exception:
-                return pd.DataFrame(columns=["date", "value"]), {
-                    "ok": False, "status": "invalid_json", "url": url_ds
+                df = _flatten_timeseries_json(js2)
+                return df, {
+                    "ok": True, "status": 200, "url": url_ds,
+                    "description": js2.get("description"), "dataset_id": dsid,
+                    "label": js2.get("label"), "source": "ONS", "debug": debug_notes
                 }
-            df = _flatten_timeseries_json(js2)
-            return df, {
-                "ok": True, "status": 200, "url": url_ds,
-                "description": js2.get("description"),
-                "dataset_id": dsid,
-                "label": js2.get("label"),
-                "source": "ONS",
-            }
+            else:
+                try:
+                    debug_notes.append(f"dataset_map body: {r2.text[:240]}")
+                except Exception:
+                    pass
+        except Exception as e:
+            debug_notes.append(f"dataset_map error: {e}")
 
-        # Clearer message if the dataset-qualified retry fails too
-        return pd.DataFrame(columns=["date", "value"]), {
-            "ok": False,
-            "status": f"{r.status_code} then {r2.status_code}",
-            "url": f"{url_primary}  | retried: {url_ds}"
-        }
-
-    # 3) No datasetId found and primary failed
+    # All attempts failed
     return pd.DataFrame(columns=["date", "value"]), {
-        "ok": False,
-        "status": r.status_code,
-        "url": url_primary
+        "ok": False, "status": "not_found_or_changed",
+        "url": url_primary, "source": "ONS", "debug": debug_notes
     }
 
 # ------------------------------------------------------------
-# Transformations / plotting
+# Transforms / plotting
 # ------------------------------------------------------------
 def pct_change_12m(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -260,9 +277,6 @@ def pct_change_mom(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def plot_line(df: pd.DataFrame, col: str, title: str, ylabel: str):
-    """
-    NOTE: We intentionally avoid setting colors/styles per design guidance.
-    """
     fig, ax = plt.subplots(figsize=(9, 4))
     ax.plot(df["date"], df[col])
     ax.set_title(title)
@@ -281,7 +295,6 @@ def download_csv(df: pd.DataFrame, filename: str, label: str):
     )
 
 def format_series_context(series_name: str, df: pd.DataFrame) -> dict:
-    """Small JSON context with last values + YoY/MoM for the chatbot."""
     if df.empty or "date" not in df or "value" not in df:
         return {"series": series_name, "status": "no_data"}
     latest = df.dropna(subset=["value"]).iloc[-1]
@@ -297,12 +310,12 @@ def format_series_context(series_name: str, df: pd.DataFrame) -> dict:
         "mom_percent": mom
     }
 
-def build_context_blob(selected_labels: List[str], label_to_code: Dict[str, str], base_url: str) -> dict:
-    """Gather small, privacy-safe context for multiple series."""
+def build_context_blob(selected_labels: List[str], label_to_code: Dict[str, str], base_url: str,
+                       dataset_map: Dict[str, str], endpoint_override: Dict[str, str]) -> dict:
     out = {"selected": []}
     for lab in selected_labels[:5]:
         code = label_to_code[lab]
-        df, meta = fetch_ons_series(code, base_url)
+        df, meta = fetch_ons_series(code, base_url, dataset_map, endpoint_override)
         out["selected"].append({
             "name": lab,
             "code": code,
@@ -315,14 +328,14 @@ def build_context_blob(selected_labels: List[str], label_to_code: Dict[str, str]
 # UI
 # ------------------------------------------------------------
 try:
-    base_url, groups = load_catalog()
+    base_url, groups, dataset_map, endpoint_override = load_catalog()
 except Exception as e:
     st.error(f"Failed to read indicators.yml — {e}")
     st.stop()
 
 st.title("UK Inflation & Price Indicators (ONS)")
 st.caption(
-    "Microservice: CPI/CPIH/RPI + sectoral, producer & trade indices. "
+    "Experimental Microservice: CPI/CPIH/RPI + sectoral, producer & trade indices. "
     "Live from ONS API (no keys).  •  Created by **Bandhu Das**"
 )
 
@@ -416,11 +429,11 @@ with tab_overview:
         st.subheader(label)
 
         with st.spinner(f"Fetching {label} ({code}) …"):
-            df, meta = fetch_ons_series(code, base_url)
+            df, meta = fetch_ons_series(code, base_url, dataset_map, endpoint_override)
 
         if not meta.get("ok") or df.empty:
             st.error(
-                f"Could not load '{label}' (code {code}). HTTP/status: {meta.get('status')}."
+                f"Could not load '{label}' (code {code}). Status: {meta.get('status')}."
             )
             st.caption(f"Endpoint attempted: {meta.get('url')}")
         else:
@@ -463,6 +476,10 @@ with tab_overview:
                     plot_line(mom, "mom_%", f"{label} — MoM %", "%")
                     download_csv(mom[["date", "mom_%"]], f"{code}_mom.csv", "MoM")
 
+        # 🔧 Debug panel: shows all URL attempts/status codes
+        with st.expander("🔧 Debug (fetch details)"):
+            st.write(meta.get("debug"))
+
 # ---------------- Compare ----------------
 with tab_compare:
     st.subheader("Overlay up to 5 series")
@@ -483,7 +500,7 @@ with tab_compare:
 
         for lab in compare_labels[:5]:
             code = label_to_code[lab]
-            series_df, meta = fetch_ons_series(code, base_url)
+            series_df, meta_c = fetch_ons_series(code, base_url, dataset_map, endpoint_override)
             if series_df.empty:
                 st.warning(f"Skipped: {lab} ({code}) — no data returned.")
                 continue
@@ -544,7 +561,10 @@ with st.expander("🧠 Reasoning Chatbot (beta)", expanded=False):
         horizontal=True,
     )
 
-    context_blob = build_context_blob(sel_labels or list(label_to_code.keys())[:1], label_to_code, base_url)
+    context_blob = build_context_blob(
+        sel_labels or list(label_to_code.keys())[:1],
+        label_to_code, base_url, dataset_map, endpoint_override
+    )
 
     if st.checkbox("Show data context sent to the model", value=False):
         st.json(context_blob)
@@ -601,7 +621,7 @@ st.markdown(
 <div style="background-color:#f5f5f5;border-left:5px solid #2E7D32;padding:1em 1.2em;margin-top:1em;">
 <b>Disclaimer:</b><br>
 This dashboard is an <i>experimental prototype</i> created as part of an educational and analytical project.
-It is <b>not an official government product or service</b> and does not represent the views or outputs of  or any UK Government department.
+It is <b>not an official government product or service</b> and does not represent the views or outputs of Defra or any UK Government department.
 Data and charts are provided for learning and demonstration purposes only.
 </div>
 <p style="margin-top:0.6em;"><i>Created by <b>Bandhu Das</b></i></p>
