@@ -181,83 +181,157 @@ def _flatten_timeseries_json(js: dict) -> pd.DataFrame:
 # Robust ONS fetcher (legacy JSON → dataset paths → beta → discovery → CSV fallback)
 # -------------------------
 @st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
-def fetch_ons_series(series_code: str, base_url: str,
-                     dataset_map: Dict[str, str],
-                     endpoint_override: Dict[str, str]) -> Tuple[pd.DataFrame, dict]:
+def fetch_ons_series(
+    series_code: str,
+    base_url: str,
+    dataset_map: Dict[str, str],
+    endpoint_override: Dict[str, str],
+) -> Tuple[pd.DataFrame, dict]:
     """
-    Updated for ONS API v1 (beta.ons.gov.uk/v1/datasets/.../observations)
-    Falls back to CSV generator if needed.
-    """
-    debug = []
+    ONS v1-first fetcher with automatic dimension discovery, then CSV fallback.
 
-    def _try_json(url: str):
+    Order:
+      1) v1 discovery on api.beta.ons.gov.uk:
+         - get latest version for the dataset
+         - list dimensions, find which dimension contains the series_code as an option.id
+         - build observations URL with the correct {dimension}={series_code}
+      2) CSV generator fallback (works across ONS site)
+    """
+    debug: List[str] = []
+
+    def _ok_df(df: pd.DataFrame, url: str, src: str, desc: str = ""):
+        if df.empty:
+            return pd.DataFrame(columns=["date","value"]), {
+                "ok": False, "status": "empty", "url": url, "source": src, "debug": debug
+            }
+        return df, {"ok": True, "status": 200, "url": url, "source": src, "description": desc, "debug": debug}
+
+    # ---------- 1) ONS v1: discover version and which dimension to filter ----------
+    ds = dataset_map.get(series_code, "MM23").lower()
+    base_v1 = f"https://api.beta.ons.gov.uk/v1/datasets/{ds}/editions/time-series"
+
+    # (a) latest version
+    try:
+        ver_url = f"{base_v1}/versions"
+        r = requests.get(ver_url, timeout=30)
+        debug.append(f"GET {ver_url} -> {r.status_code}")
+        latest_ver = None
+        if r.status_code == 200:
+            js = r.json()
+            # Try to find a version flagged latest, else take max
+            versions = js.get("items", []) if isinstance(js, dict) else []
+            if versions:
+                # latest flag or max version number
+                latest = [v for v in versions if v.get("latest")]
+                latest_ver = (latest[0]["version"]) if latest else max(v.get("version", 0) for v in versions)
+        if not latest_ver:
+            raise RuntimeError("No latest version found")
+    except Exception as e:
+        debug.append(f"Version discovery error: {e}")
+        latest_ver = None
+
+    # (b) discover which dimension has this series_code as an option
+    dim_name = None
+    if latest_ver:
         try:
-            r = requests.get(url, timeout=30)
-            debug.append(f"GET {url} -> {r.status_code}")
+            dims_url = f"{base_v1}/versions/{latest_ver}/dimensions"
+            r = requests.get(dims_url, timeout=30)
+            debug.append(f"GET {dims_url} -> {r.status_code}")
+            if r.status_code == 200:
+                dims = r.json().get("items", [])
+                # brute-force search: get options for each dimension and look for option.id == series_code.lower()
+                code_l = series_code.lower()
+                for d in dims:
+                    dn = d.get("name")
+                    if not dn:
+                        continue
+                    opts_url = f"{base_v1}/versions/{latest_ver}/dimensions/{dn}/options?limit=10000"
+                    r2 = requests.get(opts_url, timeout=30)
+                    debug.append(f"GET {opts_url} -> {r2.status_code}")
+                    if r2.status_code == 200:
+                        opts = r2.json().get("items", [])
+                        # match by id OR by option code inside 'option' field, forgiving case
+                        for opt in opts:
+                            oid = str(opt.get("id","")).lower()
+                            ocode = str(opt.get("option","")).lower()
+                            if oid == code_l or ocode == code_l:
+                                dim_name = dn
+                                break
+                        if dim_name:
+                            break
+        except Exception as e:
+            debug.append(f"Dimension discovery error: {e}")
+
+    # (c) if we found a matching dimension, fetch observations
+    if latest_ver and dim_name:
+        try:
+            obs_url = (
+                f"{base_v1}/versions/{latest_ver}/observations"
+                f"?time=*&{dim_name}={series_code.lower()}"
+            )
+            r = requests.get(obs_url, timeout=30)
+            debug.append(f"GET {obs_url} -> {r.status_code}")
             if r.status_code == 200:
                 js = r.json()
                 obs = js.get("observations", [])
-                if not obs:
-                    return None
-                df = pd.DataFrame(obs)
-                # Typical fields: time, value, and dimension labels
-                if "time" in df.columns and "value" in df.columns:
-                    df["date"] = pd.to_datetime(df["time"], errors="coerce")
-                    df["value"] = pd.to_numeric(df["value"], errors="coerce")
-                    df = df.dropna().sort_values("date").reset_index(drop=True)
-                    return df, {
-                        "ok": True, "status": 200, "url": url,
-                        "description": "v1 dataset observations", "source": "ONS v1",
-                        "debug": debug
-                    }
+                if obs:
+                    df = pd.DataFrame(obs)
+                    # Expect at least 'time' and 'value'
+                    if {"time","value"}.issubset(df.columns):
+                        df["date"] = pd.to_datetime(df["time"], errors="coerce")
+                        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+                        df = df.dropna(subset=["date","value"]).sort_values("date").reset_index(drop=True)
+                        return _ok_df(df, obs_url, "ONS v1", f"{ds} v{latest_ver}, dim={dim_name}")
+                else:
+                    debug.append("No observations returned")
         except Exception as e:
-            debug.append(f"Error: {e}")
-        return None
+            debug.append(f"Observations error: {e}")
 
-    # 1️⃣ Try v1 datasets API (beta)
-    ds = dataset_map.get(series_code, "MM23").lower()
-    candidates = [
-        f"https://api.beta.ons.gov.uk/v1/datasets/{ds}/editions/time-series/versions/7/observations?time=*&aggregate={series_code.lower()}"
-    ]
-    for url in candidates:
-        tried = _try_json(url)
-        if tried:
-            return tried
-
-    # 2️⃣ Fallback to CSV generator (still works for all series)
-    url_csv = (
+    # ---------- 2) CSV fallback (stable during transition) ----------
+    # Use dataset slug if we have it; default to mm23 for CPI-like codes
+    ds_csv = ds or ("mm23" if series_code.upper().startswith(("D7","K3","CH")) else "mm23")
+    csv_url = (
         "https://www.ons.gov.uk/generator?format=csv&uri="
-        f"/economy/inflationandpriceindices/timeseries/{series_code.lower()}/{ds}"
+        f"/economy/inflationandpriceindices/timeseries/{series_code.lower()}/{ds_csv}"
     )
     try:
-        r = requests.get(url_csv, timeout=30)
-        debug.append(f"GET {url_csv} -> {r.status_code}")
-        if r.status_code == 200:
+        r = requests.get(csv_url, timeout=30)
+        debug.append(f"GET {csv_url} -> {r.status_code}")
+        if r.status_code == 200 and r.content:
             import io
-            csv_text = r.content.decode("utf-8", errors="replace")
-            lines = csv_text.splitlines()
+            text = r.content.decode("utf-8", errors="replace")
+            lines = text.splitlines()
             start = 0
-            for i, ln in enumerate(lines[:80]):
+            for i, ln in enumerate(lines[:100]):
                 if ln.strip().lower().startswith(("date,", "month,")):
                     start = i
                     break
             df = pd.read_csv(io.StringIO("\n".join(lines[start:])))
-            val_col = [c for c in df.columns if c.lower() not in ("date", "month", "year")][0]
-            date_col = "Month" if "Month" in df.columns else "Date"
-            df["date"] = pd.to_datetime(df[date_col], errors="coerce")
-            df = df.rename(columns={val_col: "value"})[["date", "value"]].dropna()
+            # Pick the first non-date column as the value
+            val_candidates = [c for c in df.columns if c.lower() not in ("date","month","year")]
+            if not val_candidates:
+                raise RuntimeError("Could not find value column in CSV")
+            val_col = val_candidates[0]
+            date_col = "Month" if "Month" in df.columns else ("Date" if "Date" in df.columns else None)
+            if date_col:
+                df["date"] = pd.to_datetime(df[date_col], errors="coerce")
+            else:
+                # fallback: Year+Month composite
+                if "Year" in df.columns and "Month" in df.columns:
+                    df["date"] = pd.to_datetime(df["Year"].astype(str)+"-"+df["Month"].astype(str)+"-01", errors="coerce")
+                else:
+                    df["date"] = pd.NaT
+            df = df.rename(columns={val_col: "value"})[["date","value"]]
             df["value"] = pd.to_numeric(df["value"], errors="coerce")
-            df = df.dropna().sort_values("date").reset_index(drop=True)
-            return df, {
-                "ok": True, "status": 200, "url": url_csv,
-                "description": "CSV fallback", "source": "ONS CSV", "debug": debug
-            }
+            df = df.dropna(subset=["date","value"]).sort_values("date").reset_index(drop=True)
+            return _ok_df(df, csv_url, "ONS CSV", "CSV generator fallback")
     except Exception as e:
         debug.append(f"CSV fallback error: {e}")
 
-    return pd.DataFrame(columns=["date", "value"]), {
+    # ---------- Fail gracefully ----------
+    return pd.DataFrame(columns=["date","value"]), {
         "ok": False, "status": "not_found_or_changed",
-        "url": f"https://api.beta.ons.gov.uk/v1/datasets/{ds}", "debug": debug
+        "url": f"{base_v1}", "source": "ONS v1", "debug": debug
     }
 
 # -------------------------
