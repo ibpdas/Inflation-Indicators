@@ -389,6 +389,11 @@ def build_context_blob(selected_labels: List[str], label_to_code: Dict[str, str]
         })
     return out
 
+# 🔧 Debug panel: shows all URL attempts/status codes
+with st.expander("🔧 Debug (fetch details)"):
+    st.write(meta.get("debug"))
+
+
 # ------------------------------------------------------------
 # UI
 # ------------------------------------------------------------
