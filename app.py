@@ -20,7 +20,7 @@ except Exception:
 # App config
 # ------------------------------------------------------------
 st.set_page_config(
-    page_title="UK Inflation & Price Indicators (ONS) — Defra Microservice",
+    page_title="UK Inflation & Price Indicators (ONS) — Microservice",
     layout="wide",
 )
 
@@ -322,7 +322,7 @@ except Exception as e:
 
 st.title("🇬🇧 UK Inflation & Price Indicators (ONS)")
 st.caption(
-    "Defra-ready microservice: CPI/CPIH/RPI + sectoral, producer & trade indices. "
+    "-ready microservice: CPI/CPIH/RPI + sectoral, producer & trade indices. "
     "Live from ONS API (no keys).  •  Created by **Bandhu Das**"
 )
 
@@ -331,7 +331,7 @@ with st.expander("ℹ️ About this App", expanded=False):
     st.markdown(
         """
 ### 🎯 Purpose
-This dashboard is a **Defra-style microservice** that provides live UK inflation and price indicators
+This dashboard is a **-style microservice** that provides live UK inflation and price indicators
 directly from the **Office for National Statistics (ONS) Open API** — no spreadsheets or manual downloads.
 It supports economists, analysts, and policy colleagues working on food, agriculture, environment, and
 infrastructure topics where price and cost trends are critical.
@@ -601,7 +601,7 @@ st.markdown(
 <div style="background-color:#f5f5f5;border-left:5px solid #2E7D32;padding:1em 1.2em;margin-top:1em;">
 <b>Disclaimer:</b><br>
 This dashboard is an <i>experimental prototype</i> created as part of an educational and analytical project.
-It is <b>not an official government product or service</b> and does not represent the views or outputs of Defra or any UK Government department.
+It is <b>not an official government product or service</b> and does not represent the views or outputs of  or any UK Government department.
 Data and charts are provided for learning and demonstration purposes only.
 </div>
 <p style="margin-top:0.6em;"><i>Created by <b>Bandhu Das</b></i></p>
