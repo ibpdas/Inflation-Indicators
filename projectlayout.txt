@@ -1,0 +1,7 @@
+uk-inflation-microservice/
+├─ app.py
+├─ indicators.yml
+├─ requirements.txt
+├─ README.md
+└─ .streamlit/
+   └─ config.toml
