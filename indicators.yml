@@ -1,19 +1,45 @@
-ons_api_base: "https://api.beta.ons.gov.uk/v1/datasets"
+# indicators.yml — compatible with ONS API v1
+# Notes:
+# - 'dataset_map' tells the app which v1 dataset each series code belongs to.
+# - CPI/CPIH families are in MM23. Add more mappings over time for non-CPI series.
+# - Keep 'ons_api_base' as a fallback during the transition away from legacy endpoints.
 
+ons_api_base: "https://api.ons.gov.uk/timeseries/{code}/data"
+
+# ---- v1 dataset mapping (required for v1 calls; extend as needed) ----
 dataset_map:
-  D7BT: "MM23"   # CPI (all items, 2015=100)
-  L522: "MM23"   # CPIH
-  D7BU: "MM23"   # Food & non-alcoholic beverages
-  D7BZ: "MM23"   # Energy
-  K35M: "MM23"   # Water
-  K37M: "MM23"   # Transport services
-  K35Q: "MM23"   # Health
-  K35X: "MM23"   # Education
+  # Headline CPI/CPIH/RPI families (MM23)
+  D7BT: "MM23"   # CPI (All items, 2015=100)
+  L522: "MM23"   # CPIH (All items incl. OOH, 2015=100)
+  CHAW: "MM23"   # RPI (All items, Jan 1987=100)
 
+  # Common CPI component aggregates (MM23)
+  D7BU: "MM23"   # CPI: Food & Non-Alcoholic Beverages
+  D7BZ: "MM23"   # CPI: Energy (Electricity, Gas, Fuels)
+  K35M: "MM23"   # CPI: Water Supply & Sewerage
+  K37M: "MM23"   # CPI: Transport Services
+  K35Q: "MM23"   # CPI: Health
+  K35X: "MM23"   # CPI: Education
+
+  # (Optional) Add more as you verify:
+  # L55N: "MM22"   # PPI Input (All materials & fuels)  — TODO: confirm dataset
+  # L55O: "MM22"   # PPI Output (Factory gate)          — TODO: confirm dataset
+  # K62P: "MM22"   # PPI Agricultural Inputs            — TODO: confirm dataset
+  # K62Q: "MM22"   # PPI Agricultural Outputs           — TODO: confirm dataset
+  # MGS6: "MM19"   # Import Price Index (Goods)         — TODO: confirm dataset
+  # MGS7: "MM19"   # Export Price Index (Goods)         — TODO: confirm dataset
+  # K64R: "MM??"   # Construction Materials Price Index — TODO: confirm dataset
+  # K5F5: "MM??"   # Construction Output Price Index    — TODO: confirm dataset
+  # KAB9: "MM??"   # Average Weekly Earnings (Total pay) — TODO: confirm dataset
+  # A4YN: "MM??"   # Unit Labour Costs (ULC)             — TODO: confirm dataset
+  # YBHA: "MM??"   # GDP Deflator                         — TODO: confirm dataset
+
+# Full URL overrides if a specific series needs a bespoke path (rare).
 endpoint_override: {}
 
-
+# ---- Indicator groups shown in the sidebar ----
 groups:
+
   Consumer Inflation:
     - name: "CPI (All items, 2015=100)"
       code: "D7BT"
@@ -29,7 +55,7 @@ groups:
     - name: "CPI: Food & Non-Alcoholic Beverages"
       code: "D7BU"
       frequency: "Monthly"
-    - name: "CPI: Energy (Gas/Electricity/Fuels)"
+    - name: "CPI: Energy (Electricity, Gas, Fuels)"
       code: "D7BZ"
       frequency: "Monthly"
     - name: "CPI: Water Supply & Sewerage"
@@ -64,6 +90,8 @@ groups:
     - name: "Export Price Index (Goods)"
       code: "MGS7"
       frequency: "Monthly"
+
+  Construction:
     - name: "Construction Materials Price Index"
       code: "K64R"
       frequency: "Monthly"
