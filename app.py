@@ -1,4 +1,4 @@
-# app.py — UK Inflation & Price Indicators (ONS) — Streamlit
+# app.py — UK Inflation & Price Indicators — Streamlit
 # Full app with robust ONS fetch (legacy JSON + dataset paths + beta + CSV fallback),
 # About pane, Data Release Calendar, Compare view, CSV downloads, Reasoning Chatbot,
 # Debug expander, disclaimer, and credit.
@@ -335,9 +335,9 @@ except Exception as e:
     st.error(f"Failed to read indicators.yml — {e}")
     st.stop()
 
-st.title("🇬🇧 UK Inflation & Price Indicators (ONS)")
+st.title("UK Inflation & Price Indicators (ONS)")
 st.caption(
-    "Defra-ready microservice: CPI/CPIH/RPI + sectoral, producer & trade indices. "
+    "Microservice: CPI/CPIH/RPI + sectoral, producer & trade indices. "
     "Live from ONS API (no keys).  •  Created by **Bandhu Das**"
 )
 
@@ -346,7 +346,7 @@ with st.expander("ℹ️ About this App", expanded=False):
     st.markdown(
         """
 ### 🎯 Purpose
-This dashboard is a **Defra-style microservice** that provides live UK inflation and price indicators
+This dashboard is a **microservice** that provides live UK inflation and price indicators
 directly from the **Office for National Statistics (ONS) Open API** — no spreadsheets or manual downloads.
 It supports economists, analysts, and policy colleagues working on food, agriculture, environment, and
 infrastructure topics where price and cost trends are critical.
