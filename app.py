@@ -183,84 +183,83 @@ def fetch_ons_series(
     endpoint_override: Dict[str, str],
 ) -> Tuple[pd.DataFrame, dict]:
     """
-    Tries three strategies in order:
-      (A) classic:         /timeseries/{code}/data
-      (B) dataset_map:     /timeseries/{code}/dataset/{datasetId}/data  (from YAML)
-      (C) endpoint_override: use full URL from YAML (last resort)
-    Returns (df, meta) and never throws; meta['debug'] includes all attempts.
+    Tries multiple ONS endpoints in a robust order:
+    - Classic path
+    - Dataset-qualified (two permutations)
+    - Same again on beta domain
+    - Optional full override from YAML
+    Records every attempt in meta['debug'].
     """
-    debug_notes = []
+    debug: List[str] = []
 
-    # (C) Full override first if provided (explicit user choice wins)
-    if series_code in endpoint_override:
-        url = endpoint_override[series_code]
+    def _try(url: str):
         try:
             r = requests.get(url, timeout=30)
-            debug_notes.append(f"override {url} -> {r.status_code}")
+            debug.append(f"GET {url} -> {r.status_code}")
             if r.status_code == 200:
-                js = r.json()
+                try:
+                    js = r.json()
+                except Exception as e:
+                    debug.append(f"JSON error: {e}")
+                    return None
                 df = _flatten_timeseries_json(js)
-                return df, {
-                    "ok": True, "status": 200, "url": url,
-                    "description": js.get("description"), "dataset_id": js.get("datasetId"),
-                    "label": js.get("label"), "source": "ONS", "debug": debug_notes
-                }
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "url": url,
+                    "description": js.get("description"),
+                    "dataset_id": js.get("datasetId"),
+                    "label": js.get("label"),
+                    "source": "ONS",
+                }, df
             else:
+                # keep short body for troubleshooting
                 try:
-                    debug_notes.append(f"override body: {r.text[:240]}")
+                    body = r.text[:240]
+                    debug.append(f"Body: {body}")
                 except Exception:
                     pass
+                return None
         except Exception as e:
-            debug_notes.append(f"override error: {e}")
+            debug.append(f"Request error: {e}")
+            return None
 
-    # (A) Classic endpoint
-    url_primary = base_url.format(code=series_code)
-    try:
-        r = requests.get(url_primary, timeout=30)
-        debug_notes.append(f"classic {url_primary} -> {r.status_code}")
-        if r.status_code == 200:
-            js = r.json()
-            df = _flatten_timeseries_json(js)
-            return df, {
-                "ok": True, "status": 200, "url": url_primary,
-                "description": js.get("description"), "dataset_id": js.get("datasetId"),
-                "label": js.get("label"), "source": "ONS", "debug": debug_notes
-            }
-        else:
-            try:
-                debug_notes.append(f"classic body: {r.text[:240]}")
-            except Exception:
-                pass
-    except Exception as e:
-        debug_notes.append(f"classic error: {e}")
+    # 1) Classic
+    first = _try(base_url.format(code=series_code))
+    if first:
+        meta, df = first
+        meta["debug"] = debug
+        return df, meta
 
-    # (B) Dataset-qualified if we have a mapping
-    dsid = dataset_map.get(series_code)
-    if dsid:
-        url_ds = f"https://api.ons.gov.uk/timeseries/{series_code}/dataset/{dsid}/data"
-        try:
-            r2 = requests.get(url_ds, timeout=30)
-            debug_notes.append(f"dataset_map {url_ds} -> {r2.status_code}")
-            if r2.status_code == 200:
-                js2 = r2.json()
-                df = _flatten_timeseries_json(js2)
-                return df, {
-                    "ok": True, "status": 200, "url": url_ds,
-                    "description": js2.get("description"), "dataset_id": dsid,
-                    "label": js2.get("label"), "source": "ONS", "debug": debug_notes
-                }
-            else:
-                try:
-                    debug_notes.append(f"dataset_map body: {r2.text[:240]}")
-                except Exception:
-                    pass
-        except Exception as e:
-            debug_notes.append(f"dataset_map error: {e}")
+    # 2) Dataset-qualified (if known)
+    ds = dataset_map.get(series_code)
+    candidates: List[str] = []
+    if ds:
+        candidates.extend([
+            f"https://api.ons.gov.uk/timeseries/{series_code}/dataset/{ds}/data",
+            f"https://api.ons.gov.uk/dataset/{ds}/timeseries/{series_code}/data",
+            f"https://api.beta.ons.gov.uk/timeseries/{series_code}/dataset/{ds}/data",
+            f"https://api.beta.ons.gov.uk/dataset/{ds}/timeseries/{series_code}/data",
+        ])
 
-    # All attempts failed
+    # 3) Optional full override (put it last so explicit mapping wins if present)
+    if series_code in endpoint_override:
+        candidates.append(endpoint_override[series_code])
+
+    for url in candidates:
+        tried = _try(url)
+        if tried:
+            meta, df = tried
+            meta["debug"] = debug
+            return df, meta
+
+    # 4) All attempts failed
     return pd.DataFrame(columns=["date", "value"]), {
-        "ok": False, "status": "not_found_or_changed",
-        "url": url_primary, "source": "ONS", "debug": debug_notes
+        "ok": False,
+        "status": "not_found_or_changed",
+        "url": base_url.format(code=series_code),
+        "source": "ONS",
+        "debug": debug,
     }
 
 # ------------------------------------------------------------
