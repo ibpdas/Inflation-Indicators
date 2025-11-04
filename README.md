@@ -1,6 +1,6 @@
 # UK Inflation & Price Indicators — Data Agent Microservice (Streamlit)
 
-A lightweight **Streamlit** app that fetches official UK price and inflation indicators from the **ONS Open API** —
+A lightweight data agent that fetches UK price and inflation indicators -
 ready for **economists and analysts**. Includes CPI/CPIH/RPI, sectoral CPI components (food, energy, water),
 producer & trade price indices (PPI input/output, import/export), and macro/labour indicators (AWE, ULC, GDP deflator).
 
